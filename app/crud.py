@@ -17,12 +17,29 @@ def create_user(db: Session, user_in: schemas.UserCreate) -> models.User:
     return user
 
 
+def get_user_by_phone(db: Session, phone: str) -> models.User | None:
+    return db.query(models.User).filter(models.User.phone == phone).first()
+
+
 def create_restaurant(db: Session, restaurant_in: schemas.RestaurantCreate) -> models.Restaurant:
     restaurant = models.Restaurant(name=restaurant_in.name, category=restaurant_in.category)
     db.add(restaurant)
     db.commit()
     db.refresh(restaurant)
     return restaurant
+
+
+def list_restaurants(db: Session) -> list[models.Restaurant]:
+    return db.query(models.Restaurant).order_by(models.Restaurant.id).all()
+
+
+def list_user_reservations(db: Session, user_id: int) -> list[models.Reservation]:
+    return (
+        db.query(models.Reservation)
+        .filter(models.Reservation.user_id == user_id)
+        .order_by(models.Reservation.reserved_at.desc())
+        .all()
+    )
 
 
 def create_reservation(db: Session, reservation_in: schemas.ReservationCreate) -> models.Reservation:

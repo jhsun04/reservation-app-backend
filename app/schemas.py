@@ -2,8 +2,9 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field
 
+from app import trust_score
 from app.models import EventType
 
 
@@ -22,6 +23,13 @@ class UserOut(BaseModel):
     consecutive_success_streak: int
     late_count: int
     flagged_for_review: bool
+
+    @computed_field
+    @property
+    def trust_band(self) -> str:
+        """VIP / STANDARD / CAUTION / RISK — 프론트엔드가 구간 경계값을 따로 알 필요 없게
+        여기서 계산해서 내려준다 (신뢰점수 구간 로직은 app/trust_score.py 한 곳에만 존재해야 함)."""
+        return trust_score.get_band(self.trust_score).value
 
 
 class RestaurantCreate(BaseModel):
