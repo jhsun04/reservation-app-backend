@@ -74,7 +74,12 @@ class Restaurant(Base):
 
     # 구독 티어: STARTER / STANDARD / PREMIUM (문자열로 단순 구현, 나중에 결제 붙이면 확장)
     subscription_tier = Column(String, nullable=False, default="STARTER")
+    subscription_started_at = Column(DateTime, default=datetime.utcnow)
     subscription_free_trial_ends_at = Column(DateTime, nullable=True)
+
+    # 매장이 직접 정하는 노쇼 리스크 허용도: STRICT(엄격) / NORMAL(보통) / LENIENT(관대)
+    # 스탠다드 이상 티어에서만 NORMAL이 아닌 값으로 바꿀 수 있다 (app/subscription.py 참고)
+    risk_tolerance = Column(String, nullable=False, default="NORMAL")
 
     reservations = relationship("Reservation", back_populates="restaurant")
 

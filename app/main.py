@@ -2,7 +2,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
-from app import crud, models, schemas
+from app import crud, models, schemas, subscription
 from app.database import Base, SessionLocal, engine, get_db
 
 Base.metadata.create_all(bind=engine)
@@ -62,6 +62,39 @@ def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
     if restaurant is None:
         raise HTTPException(status_code=404, detail="restaurant_not_found")
     return restaurant
+
+
+@app.patch("/restaurants/{restaurant_id}/subscription-tier", response_model=schemas.RestaurantOut)
+def update_subscription_tier(
+    restaurant_id: int,
+    payload: schemas.SubscriptionTierUpdate,
+    db: Session = Depends(get_db),
+):
+    """지금은 결제(PG) 연동 전이라 관리자가 수동으로 티어를 바꿔주는 용도.
+    실제 결제 붙으면 이 엔드포인트를 결제 성공 콜백에서 호출하는 식으로 바뀔 것."""
+    if payload.subscription_tier not in subscription.VALID_TIERS:
+        raise HTTPException(status_code=422, detail="invalid_tier")
+    try:
+        return crud.update_subscription_tier(db, restaurant_id, payload.subscription_tier)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/restaurants/{restaurant_id}/risk-tolerance", response_model=schemas.RestaurantOut)
+def update_risk_tolerance(
+    restaurant_id: int,
+    payload: schemas.RiskToleranceUpdate,
+    db: Session = Depends(get_db),
+):
+    """스탠다드 이상 구독 매장만 자기 가게의 노쇼 리스크 허용도를 바꿀 수 있다."""
+    if payload.risk_tolerance not in subscription.VALID_RISK_TOLERANCES:
+        raise HTTPException(status_code=422, detail="invalid_risk_tolerance")
+    try:
+        return crud.update_risk_tolerance(db, restaurant_id, payload.risk_tolerance)
+    except subscription.SubscriptionPermissionError as e:
+        raise HTTPException(status_code=403, detail=e.message)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.post("/reservations", response_model=schemas.ReservationOut)

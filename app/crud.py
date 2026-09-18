@@ -2,7 +2,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app import models, schemas, trust_score
+from app import models, schemas, subscription, trust_score
 
 
 def create_user(db: Session, user_in: schemas.UserCreate) -> models.User:
@@ -22,8 +22,48 @@ def get_user_by_phone(db: Session, phone: str) -> models.User | None:
 
 
 def create_restaurant(db: Session, restaurant_in: schemas.RestaurantCreate) -> models.Restaurant:
-    restaurant = models.Restaurant(name=restaurant_in.name, category=restaurant_in.category)
+    now = datetime.utcnow()
+    restaurant = models.Restaurant(
+        name=restaurant_in.name,
+        category=restaurant_in.category,
+        subscription_started_at=now,
+        # 가입 즉시 무료 체험 기간(90일)을 부여한다.
+        subscription_free_trial_ends_at=subscription.trial_ends_at(now),
+    )
     db.add(restaurant)
+    db.commit()
+    db.refresh(restaurant)
+    return restaurant
+
+
+def update_subscription_tier(db: Session, restaurant_id: int, tier: str) -> models.Restaurant:
+    restaurant = db.query(models.Restaurant).get(restaurant_id)
+    if restaurant is None:
+        raise ValueError("restaurant_not_found")
+    if tier not in subscription.VALID_TIERS:
+        raise ValueError("invalid_tier")
+
+    restaurant.subscription_tier = tier
+    # 스탠다드 미만으로 내려가면 리스크 허용도 설정 권한도 같이 없어지므로 기본값(NORMAL)으로 되돌린다.
+    if not subscription.tier_at_least(tier, "STANDARD"):
+        restaurant.risk_tolerance = "NORMAL"
+
+    db.commit()
+    db.refresh(restaurant)
+    return restaurant
+
+
+def update_risk_tolerance(db: Session, restaurant_id: int, risk_tolerance: str) -> models.Restaurant:
+    restaurant = db.query(models.Restaurant).get(restaurant_id)
+    if restaurant is None:
+        raise ValueError("restaurant_not_found")
+    if risk_tolerance not in subscription.VALID_RISK_TOLERANCES:
+        raise ValueError("invalid_risk_tolerance")
+
+    # 티어 미달이면 SubscriptionPermissionError를 던진다 (호출부에서 403으로 변환).
+    subscription.assert_can_set_risk_tolerance(restaurant.subscription_tier)
+
+    restaurant.risk_tolerance = risk_tolerance
     db.commit()
     db.refresh(restaurant)
     return restaurant
@@ -46,9 +86,14 @@ def create_reservation(db: Session, reservation_in: schemas.ReservationCreate) -
     user = db.query(models.User).get(reservation_in.user_id)
     if user is None:
         raise ValueError("user_not_found")
+    restaurant = db.query(models.Restaurant).get(reservation_in.restaurant_id)
+    if restaurant is None:
+        raise ValueError("restaurant_not_found")
 
     band = trust_score.get_band(user.trust_score)
     policy = trust_score.get_deposit_policy(band, party_size=reservation_in.party_size)
+    # 신뢰점수만으로 계산된 보증금에 매장이 설정한 리스크 허용도 배율을 반영한다.
+    policy = subscription.apply_risk_tolerance(policy, restaurant.risk_tolerance)
 
     reservation = models.Reservation(
         user_id=reservation_in.user_id,

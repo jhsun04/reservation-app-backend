@@ -4,7 +4,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, computed_field
 
-from app import trust_score
+from app import subscription, trust_score
 from app.models import EventType
 
 
@@ -44,6 +44,28 @@ class RestaurantOut(BaseModel):
     name: str
     category: Optional[str]
     subscription_tier: str
+    risk_tolerance: str
+    subscription_free_trial_ends_at: Optional[datetime]
+
+    @computed_field
+    @property
+    def is_free_trial_active(self) -> bool:
+        return subscription.is_free_trial_active(self.subscription_free_trial_ends_at)
+
+    @computed_field
+    @property
+    def can_set_risk_tolerance(self) -> bool:
+        """프론트엔드가 리스크 허용도 설정 UI를 보여줄지 판단할 때 쓰는 값
+        (스탠다드 이상 티어만 True)."""
+        return subscription.tier_at_least(self.subscription_tier, "STANDARD")
+
+
+class SubscriptionTierUpdate(BaseModel):
+    subscription_tier: str
+
+
+class RiskToleranceUpdate(BaseModel):
+    risk_tolerance: str
 
 
 class ReservationCreate(BaseModel):
