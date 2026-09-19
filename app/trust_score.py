@@ -18,6 +18,22 @@
   스택 자체를 끊지는 않는다. 취소도 스택을 끊어야 한다면 RESETTING_EVENTS에
   CANCEL_DAY_BEFORE / CANCEL_IMMINENT를 추가하면 된다.
 - CAUTION 구간 예약금율은 25%, RISK 구간은 75%로 각 범위의 중간값을 기본값으로 잡았다.
+
+2차 보완 (사용자가 지적한 허점 반영, 이번에 추가):
+- "예약금 몇 %"는 인원수만으로 예약하는 구조에서는 곱할 기준 금액이 없어서
+  성립하지 않는 개념이었다. 그래서 매장이 price_per_person(코스가/객단가)을
+  등록했을 때만 진짜 % 선결제(PREPAID)를 적용하고, 등록 안 했으면(대부분의
+  캐주얼 식당) CAUTION/RISK도 STANDARD처럼 정액 노쇼시청구(HOLD)로 처리한다.
+  자세한 이유는 get_deposit_policy 참고.
+- 신규 유저(이 앱에서 예약 이력이 0건)는 시작 점수(60점)만 보면 STANDARD로
+  분류되지만, "이력이 아예 없다"는 것 자체가 이력 기반 신뢰점수 시스템에서는
+  가장 리스크가 큰 상태다. 그래서 첫 예약 1건만은 점수와 무관하게 최소
+  CAUTION 수준으로 강제한다 (escalate_band_for_cold_start 참고).
+- 그룹 예약 중 일부만 안 온 "부분 노쇼"는 신뢰점수는 깎지 않기로 했지만
+  (기존 결정 유지), 매장이 실제로 보는 경제적 손해는 그대로 남는다. HOLD형
+  보증금이면 안 온 인원 비율만큼 실제 청구액을 계산해준다
+  (calculate_partial_no_show_charge 참고). PREPAID형(이미 전액 선결제된 경우)
+  부분 환불 로직은 아직 안 만들었다 — 환불 정책을 먼저 정해야 해서 다음 과제로 남김.
 """
 from __future__ import annotations
 
@@ -61,9 +77,19 @@ STREAK_RESETTING_EVENTS = {EventType.NO_SHOW_SAME_DAY, EventType.NO_SHOW_DUPLICA
 RISK_BAND_RECOVERY_MIN_SUCCESS = 3
 RISK_BAND_RECOVERY_MIN_DAYS = 14
 
-CAUTION_DEPOSIT_RATE_DEFAULT = 0.25  # 기획서 범위: 20~30%
-RISK_DEPOSIT_RATE_DEFAULT = 0.75  # 기획서 범위: 50~100%
+CAUTION_DEPOSIT_RATE_DEFAULT = 0.25  # 기획서 범위: 20~30% (price_per_person 등록된 매장에서만 적용)
+RISK_DEPOSIT_RATE_DEFAULT = 0.75  # 기획서 범위: 50~100% (price_per_person 등록된 매장에서만 적용)
+
+# price_per_person을 등록하지 않은 매장(대부분의 캐주얼 식당)에 적용되는 정액 노쇼시청구 금액
 STANDARD_NO_SHOW_FLAT_FEE_PER_PERSON = 5000
+CAUTION_NO_SHOW_FLAT_FEE_PER_PERSON = 15000
+RISK_NO_SHOW_FLAT_FEE_PER_PERSON = 30000
+
+# 콜드스타트 보정: 이력이 몇 건 이상 쌓여야 "이력 없음" 취급을 벗어나는지
+COLD_START_RESERVATION_THRESHOLD = 1  # 첫 예약(0건째)에만 적용
+
+# 밴드별 엄격도 순서 (숫자가 클수록 더 엄격 = 보증금 정책이 더 세짐)
+BAND_SEVERITY = {TrustBand.VIP: 0, TrustBand.STANDARD: 1, TrustBand.CAUTION: 2, TrustBand.RISK: 3}
 
 
 def clamp_score(score: int) -> int:
@@ -77,18 +103,80 @@ def get_band(score: int) -> TrustBand:
     return TrustBand.RISK
 
 
-def get_deposit_policy(band: TrustBand, party_size: int = 1) -> dict:
-    """예약 생성 시점에 저장해둘 보증금 정책을 반환한다."""
+def get_deposit_policy(
+    band: TrustBand,
+    party_size: int = 1,
+    price_per_person: Optional[int] = None,
+) -> dict:
+    """예약 생성 시점에 저장해둘 보증금 정책을 반환한다.
+
+    반환값의 deposit_type:
+    - NONE: 보증금 없음 (VIP)
+    - HOLD: 카드 사전승인만 걸어두고, 실제 노쇼가 발생했을 때만 청구
+    - PREPAID: 예약 시점에 즉시 결제 (매장이 price_per_person을 등록한 경우에만
+      CAUTION/RISK 구간에서 쓸 수 있음 — %를 곱할 기준 금액이 있어야 하기 때문)
+
+    price_per_person이 없는 매장(순수 인원수 예약)에서는 CAUTION/RISK도 HOLD로
+    처리하고, 대신 밴드가 나빠질수록 정액 청구 금액을 올린다.
+    """
     if band == TrustBand.VIP:
-        return {"deposit_rate": 0.0, "deposit_flat_fee": 0}
+        return {"deposit_type": "NONE", "deposit_amount": 0, "deposit_rate": None}
+
     if band == TrustBand.STANDARD:
         return {
-            "deposit_rate": 0.0,
-            "deposit_flat_fee": STANDARD_NO_SHOW_FLAT_FEE_PER_PERSON * party_size,
+            "deposit_type": "HOLD",
+            "deposit_amount": STANDARD_NO_SHOW_FLAT_FEE_PER_PERSON * party_size,
+            "deposit_rate": None,
         }
+
     if band == TrustBand.CAUTION:
-        return {"deposit_rate": CAUTION_DEPOSIT_RATE_DEFAULT, "deposit_flat_fee": 0}
-    return {"deposit_rate": RISK_DEPOSIT_RATE_DEFAULT, "deposit_flat_fee": 0}
+        if price_per_person:
+            amount = round(CAUTION_DEPOSIT_RATE_DEFAULT * price_per_person * party_size)
+            return {"deposit_type": "PREPAID", "deposit_amount": amount, "deposit_rate": CAUTION_DEPOSIT_RATE_DEFAULT}
+        return {
+            "deposit_type": "HOLD",
+            "deposit_amount": CAUTION_NO_SHOW_FLAT_FEE_PER_PERSON * party_size,
+            "deposit_rate": None,
+        }
+
+    # RISK
+    if price_per_person:
+        amount = round(RISK_DEPOSIT_RATE_DEFAULT * price_per_person * party_size)
+        return {"deposit_type": "PREPAID", "deposit_amount": amount, "deposit_rate": RISK_DEPOSIT_RATE_DEFAULT}
+    return {
+        "deposit_type": "HOLD",
+        "deposit_amount": RISK_NO_SHOW_FLAT_FEE_PER_PERSON * party_size,
+        "deposit_rate": None,
+    }
+
+
+def escalate_band_for_cold_start(band: TrustBand, total_reservations_count: int) -> TrustBand:
+    """이력이 없는(총 예약 0건) 유저의 첫 예약은, 점수상 밴드가 그보다 느슨하더라도
+    최소 CAUTION 수준으로 끌어올린다. 이미 CAUTION/RISK보다 엄격하면 그대로 둔다."""
+    if total_reservations_count >= COLD_START_RESERVATION_THRESHOLD:
+        return band
+    if BAND_SEVERITY[band] < BAND_SEVERITY[TrustBand.CAUTION]:
+        return TrustBand.CAUTION
+    return band
+
+
+def calculate_partial_no_show_charge(
+    deposit_type: str,
+    deposit_amount: int,
+    party_size: int,
+    no_show_count: int,
+) -> int:
+    """부분 노쇼(일행 중 일부만 불참) 시 실제로 청구할 금액.
+
+    HOLD형 보증금은 원래 인원수 기준으로 총액이 계산돼 있으므로, 안 온 인원
+    비율만큼만 청구한다. PREPAID형(이미 전액 선결제됨)은 부분 환불이 필요한
+    문제라 아직 계산하지 않는다 (환불 정책 미정 — 0을 반환하고 별도 처리 필요).
+    """
+    if deposit_type != "HOLD" or party_size <= 0:
+        return 0
+    no_show_count = max(0, min(no_show_count, party_size))
+    per_person = deposit_amount / party_size
+    return round(per_person * no_show_count)
 
 
 def _streak_bonus(streak_count: int) -> int:

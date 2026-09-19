@@ -64,11 +64,22 @@ def assert_can_set_risk_tolerance(tier: str) -> None:
 
 
 def apply_risk_tolerance(deposit_policy: dict, risk_tolerance: str) -> dict:
-    """신뢰점수만으로 계산된 보증금 정책에 매장의 리스크 허용도 배율을 곱해서 보정한다."""
+    """신뢰점수만으로 계산된 보증금 정책(deposit_type/deposit_amount/deposit_rate)에
+    매장의 리스크 허용도 배율을 곱해서 보정한다.
+
+    deposit_amount는 항상 배율을 반영한다. deposit_rate는 PREPAID일 때만 의미가
+    있는 "몇 %였는지" 기록용 값이라, 같이 배율을 곱해서 0~1로 클램프해둔다
+    (실제 청구액은 deposit_amount 쪽이 기준).
+    """
     multiplier = RISK_TOLERANCE_MULTIPLIER.get(risk_tolerance, 1.0)
-    adjusted_rate = deposit_policy["deposit_rate"] * multiplier
-    adjusted_flat_fee = deposit_policy["deposit_flat_fee"] * multiplier
+    adjusted_amount = max(0, round(deposit_policy["deposit_amount"] * multiplier))
+
+    adjusted_rate = deposit_policy.get("deposit_rate")
+    if adjusted_rate is not None:
+        adjusted_rate = round(min(1.0, max(0.0, adjusted_rate * multiplier)), 4)
+
     return {
-        "deposit_rate": round(min(1.0, max(0.0, adjusted_rate)), 4),
-        "deposit_flat_fee": max(0, round(adjusted_flat_fee)),
+        "deposit_type": deposit_policy["deposit_type"],
+        "deposit_amount": adjusted_amount,
+        "deposit_rate": adjusted_rate,
     }

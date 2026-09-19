@@ -2,7 +2,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
-from app import crud, models, schemas, subscription
+from app import auth, crud, models, schemas, subscription
 from app.database import Base, SessionLocal, engine, get_db
 
 Base.metadata.create_all(bind=engine)
@@ -19,9 +19,24 @@ app.add_middleware(
 )
 
 
-@app.post("/users", response_model=schemas.UserOut)
-def create_user(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
-    return crud.create_user(db, user_in)
+@app.post("/auth/register", response_model=schemas.TokenOut)
+def register(register_in: schemas.AuthRegister, db: Session = Depends(get_db)):
+    try:
+        user = crud.register_user(db, register_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    token = auth.create_access_token(user.id)
+    return schemas.TokenOut(access_token=token, user=user)
+
+
+@app.post("/auth/login", response_model=schemas.TokenOut)
+def login(login_in: schemas.AuthLogin, db: Session = Depends(get_db)):
+    try:
+        user = crud.authenticate_user(db, login_in.phone, login_in.password)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    token = auth.create_access_token(user.id)
+    return schemas.TokenOut(access_token=token, user=user)
 
 
 @app.get("/users/{user_id}", response_model=schemas.UserOut)
@@ -32,17 +47,13 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
     return user
 
 
-@app.get("/users/by-phone/{phone}", response_model=schemas.UserOut)
-def get_user_by_phone(phone: str, db: Session = Depends(get_db)):
-    """플러터 앱의 '전화번호로 시작하기' 흐름용: 없으면 404 -> 프론트에서 POST /users로 새로 만듦."""
-    user = crud.get_user_by_phone(db, phone)
-    if user is None:
-        raise HTTPException(status_code=404, detail="user_not_found")
-    return user
-
-
 @app.get("/users/{user_id}/reservations", response_model=list[schemas.ReservationOut])
-def list_user_reservations(user_id: int, db: Session = Depends(get_db)):
+def list_user_reservations(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    auth.require_self(user_id, current_user)
     return crud.list_user_reservations(db, user_id)
 
 
@@ -97,10 +108,28 @@ def update_risk_tolerance(
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@app.post("/reservations", response_model=schemas.ReservationOut)
-def create_reservation(reservation_in: schemas.ReservationCreate, db: Session = Depends(get_db)):
+@app.patch("/restaurants/{restaurant_id}/price-per-person", response_model=schemas.RestaurantOut)
+def update_price_per_person(
+    restaurant_id: int,
+    payload: schemas.PricePerPersonUpdate,
+    db: Session = Depends(get_db),
+):
+    """코스/오마카세처럼 1인당 가격이 고정된 매장만 설정. 이 값이 있어야 CAUTION/RISK
+    구간에서 진짜 %선결제(PREPAID)가 적용되고, 없으면 정액 노쇼시청구(HOLD)로 처리된다."""
     try:
-        return crud.create_reservation(db, reservation_in)
+        return crud.update_price_per_person(db, restaurant_id, payload.price_per_person)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/reservations", response_model=schemas.ReservationOut)
+def create_reservation(
+    reservation_in: schemas.ReservationCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    try:
+        return crud.create_reservation(db, reservation_in, user_id=current_user.id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -110,10 +139,15 @@ def apply_reservation_event(
     reservation_id: int,
     event_in: schemas.ReservationEventIn,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
 ):
     try:
-        event = crud.apply_reservation_event(db, reservation_id, event_in)
+        event = crud.apply_reservation_event(
+            db, reservation_id, event_in, acting_user_id=current_user.id
+        )
     except ValueError as e:
+        if str(e) == "not_your_reservation":
+            raise HTTPException(status_code=403, detail=str(e))
         raise HTTPException(status_code=404, detail=str(e))
 
     return {
@@ -121,5 +155,6 @@ def apply_reservation_event(
         "score_delta": event.score_delta,
         "score_before": event.score_before,
         "score_after": event.score_after,
+        "charged_amount": event.charged_amount,
         "note": event.note,
     }

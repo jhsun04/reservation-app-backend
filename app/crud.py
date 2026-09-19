@@ -1,19 +1,30 @@
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app import models, schemas, subscription, trust_score
+from app import auth, models, schemas, subscription, trust_score
 
 
-def create_user(db: Session, user_in: schemas.UserCreate) -> models.User:
+def register_user(db: Session, register_in: schemas.AuthRegister) -> models.User:
+    if get_user_by_phone(db, register_in.phone) is not None:
+        raise ValueError("phone_already_registered")
     user = models.User(
-        name=user_in.name,
-        phone=user_in.phone,
+        name=register_in.name,
+        phone=register_in.phone,
+        hashed_password=auth.hash_password(register_in.password),
         trust_score=trust_score.START_SCORE,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+    return user
+
+
+def authenticate_user(db: Session, phone: str, password: str) -> models.User:
+    user = get_user_by_phone(db, phone)
+    if user is None or not auth.verify_password(password, user.hashed_password):
+        raise ValueError("invalid_credentials")
     return user
 
 
@@ -26,11 +37,22 @@ def create_restaurant(db: Session, restaurant_in: schemas.RestaurantCreate) -> m
     restaurant = models.Restaurant(
         name=restaurant_in.name,
         category=restaurant_in.category,
+        price_per_person=restaurant_in.price_per_person,
         subscription_started_at=now,
         # 가입 즉시 무료 체험 기간(90일)을 부여한다.
         subscription_free_trial_ends_at=subscription.trial_ends_at(now),
     )
     db.add(restaurant)
+    db.commit()
+    db.refresh(restaurant)
+    return restaurant
+
+
+def update_price_per_person(db: Session, restaurant_id: int, price_per_person: Optional[int]) -> models.Restaurant:
+    restaurant = db.query(models.Restaurant).get(restaurant_id)
+    if restaurant is None:
+        raise ValueError("restaurant_not_found")
+    restaurant.price_per_person = price_per_person
     db.commit()
     db.refresh(restaurant)
     return restaurant
@@ -82,8 +104,10 @@ def list_user_reservations(db: Session, user_id: int) -> list[models.Reservation
     )
 
 
-def create_reservation(db: Session, reservation_in: schemas.ReservationCreate) -> models.Reservation:
-    user = db.query(models.User).get(reservation_in.user_id)
+def create_reservation(
+    db: Session, reservation_in: schemas.ReservationCreate, user_id: int
+) -> models.Reservation:
+    user = db.query(models.User).get(user_id)
     if user is None:
         raise ValueError("user_not_found")
     restaurant = db.query(models.Restaurant).get(reservation_in.restaurant_id)
@@ -91,20 +115,29 @@ def create_reservation(db: Session, reservation_in: schemas.ReservationCreate) -
         raise ValueError("restaurant_not_found")
 
     band = trust_score.get_band(user.trust_score)
-    policy = trust_score.get_deposit_policy(band, party_size=reservation_in.party_size)
+    # 이력이 없는(총 예약 0건) 유저의 첫 예약은 점수와 무관하게 최소 CAUTION 수준으로.
+    band = trust_score.escalate_band_for_cold_start(band, user.total_reservations_count)
+
+    policy = trust_score.get_deposit_policy(
+        band,
+        party_size=reservation_in.party_size,
+        price_per_person=restaurant.price_per_person,
+    )
     # 신뢰점수만으로 계산된 보증금에 매장이 설정한 리스크 허용도 배율을 반영한다.
     policy = subscription.apply_risk_tolerance(policy, restaurant.risk_tolerance)
 
     reservation = models.Reservation(
-        user_id=reservation_in.user_id,
+        user_id=user_id,
         restaurant_id=reservation_in.restaurant_id,
         party_size=reservation_in.party_size,
         reserved_at=reservation_in.reserved_at,
+        deposit_type=policy["deposit_type"],
+        deposit_amount=policy["deposit_amount"],
         deposit_rate=policy["deposit_rate"],
-        deposit_flat_fee=policy["deposit_flat_fee"],
         status="CONFIRMED",
     )
     db.add(reservation)
+    user.total_reservations_count += 1
     db.commit()
     db.refresh(reservation)
     return reservation
@@ -114,10 +147,13 @@ def apply_reservation_event(
     db: Session,
     reservation_id: int,
     event_in: schemas.ReservationEventIn,
+    acting_user_id: int,
 ) -> models.TrustScoreEvent:
     reservation = db.query(models.Reservation).get(reservation_id)
     if reservation is None:
         raise ValueError("reservation_not_found")
+    if reservation.user_id != acting_user_id:
+        raise ValueError("not_your_reservation")
     user = db.query(models.User).get(reservation.user_id)
     if user is None:
         raise ValueError("user_not_found")
@@ -127,6 +163,21 @@ def apply_reservation_event(
         event_type=event_in.event_type,
         force_majeure_reason=event_in.force_majeure_reason,
     )
+
+    # 부분 노쇼: 신뢰점수는 안 깎지만(기존 결정 유지), HOLD형 보증금이면
+    # 실제로 안 온 인원 비율만큼 매장에 청구할 금액을 계산해서 기록해준다.
+    charged_amount = 0
+    if event_in.event_type == models.EventType.PARTIAL_NO_SHOW and event_in.no_show_count is not None:
+        charged_amount = trust_score.calculate_partial_no_show_charge(
+            deposit_type=reservation.deposit_type,
+            deposit_amount=reservation.deposit_amount,
+            party_size=reservation.party_size,
+            no_show_count=event_in.no_show_count,
+        )
+        if reservation.deposit_type == "PREPAID":
+            result.note = (result.note + " / " if result.note else "") + (
+                "PREPAID(선결제)형 보증금의 부분 노쇼 환불 로직은 아직 없음 — 별도 정산 필요"
+            )
 
     # 예약 상태 갱신
     status_map = {
@@ -147,6 +198,7 @@ def apply_reservation_event(
         score_delta=result.delta,
         score_before=result.score_before,
         score_after=result.score_after,
+        charged_amount=charged_amount,
         note=result.note,
     )
     db.add(event_record)

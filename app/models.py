@@ -45,6 +45,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     phone = Column(String, unique=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
 
     trust_score = Column(Integer, nullable=False, default=60)
     consecutive_success_streak = Column(Integer, nullable=False, default=0)
@@ -55,6 +56,11 @@ class User(Base):
     # 25점 이하 위험 구간 회복 트랙 추적용
     risk_band_entered_at = Column(DateTime, nullable=True)
     risk_band_success_count = Column(Integer, nullable=False, default=0)
+
+    # 콜드스타트(이력 없는 신규 유저) 보정용: 지금까지 이 유저가 만든 예약 총 건수.
+    # 0이면 "이력 자체가 없는" 첫 예약이라는 뜻이라, 점수와 무관하게 최소 CAUTION
+    # 수준으로 보증금 정책을 적용한다 (app/trust_score.py 참고).
+    total_reservations_count = Column(Integer, nullable=False, default=0)
 
     # 동일 사유 불가항력 증빙 반복 제출 감지용
     force_majeure_reasons = Column(String, nullable=True)  # 콤마로 구분된 사유 로그(간단 구현)
@@ -81,6 +87,12 @@ class Restaurant(Base):
     # 스탠다드 이상 티어에서만 NORMAL이 아닌 값으로 바꿀 수 있다 (app/subscription.py 참고)
     risk_tolerance = Column(String, nullable=False, default="NORMAL")
 
+    # 코스/오마카세처럼 1인당 가격이 고정된 매장만 입력하는 값 (원 단위, 선택).
+    # 이 값이 있어야만 "예약금 몇 %"라는 개념이 성립한다 — 순수 인원수 예약에는
+    # 곱할 기준 금액이 없기 때문에, 이 값이 없으면 CAUTION/RISK 구간도 정액
+    # 노쇼시청구(HOLD) 방식으로 처리한다 (app/trust_score.get_deposit_policy 참고).
+    price_per_person = Column(Integer, nullable=True)
+
     reservations = relationship("Reservation", back_populates="restaurant")
 
 
@@ -94,9 +106,11 @@ class Reservation(Base):
     party_size = Column(Integer, nullable=False)
     reserved_at = Column(DateTime, nullable=False)  # 예약된 방문 일시
 
-    # 이 예약 시점에 계산된 보증금 정책 (신뢰점수 기반)
-    deposit_rate = Column(Float, nullable=False, default=0.0)  # 0.0~1.0 (선결제 비율)
-    deposit_flat_fee = Column(Integer, nullable=False, default=0)  # 가상 보증금(노쇼시만 청구) 금액
+    # 이 예약 시점에 계산된 보증금 정책 (신뢰점수 기반).
+    # deposit_type: NONE(없음) / HOLD(사전승인, 노쇼시에만 실제 청구) / PREPAID(즉시 선결제)
+    deposit_type = Column(String, nullable=False, default="NONE")
+    deposit_amount = Column(Integer, nullable=False, default=0)  # 원 단위, party_size 반영된 총액
+    deposit_rate = Column(Float, nullable=True)  # PREPAID일 때만 의미 있음 (몇 %였는지 기록용)
 
     status = Column(String, nullable=False, default="CONFIRMED")
     # CONFIRMED / FULFILLED / NO_SHOW / CANCELLED
@@ -119,6 +133,9 @@ class TrustScoreEvent(Base):
     score_delta = Column(Integer, nullable=False)
     score_before = Column(Integer, nullable=False)
     score_after = Column(Integer, nullable=False)
+
+    # PARTIAL_NO_SHOW 등에서 신뢰점수와는 별개로 매장에 실제 청구되는 금액 (원)
+    charged_amount = Column(Integer, nullable=False, default=0)
 
     note = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
