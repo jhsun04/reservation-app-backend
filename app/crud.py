@@ -32,12 +32,20 @@ def get_user_by_phone(db: Session, phone: str) -> models.User | None:
     return db.query(models.User).filter(models.User.phone == phone).first()
 
 
-def create_restaurant(db: Session, restaurant_in: schemas.RestaurantCreate) -> models.Restaurant:
+def get_restaurant_by_owner_phone(db: Session, owner_phone: str) -> models.Restaurant | None:
+    return db.query(models.Restaurant).filter(models.Restaurant.owner_phone == owner_phone).first()
+
+
+def register_restaurant(db: Session, register_in: schemas.RestaurantAuthRegister) -> models.Restaurant:
+    if get_restaurant_by_owner_phone(db, register_in.owner_phone) is not None:
+        raise ValueError("phone_already_registered")
     now = datetime.utcnow()
     restaurant = models.Restaurant(
-        name=restaurant_in.name,
-        category=restaurant_in.category,
-        price_per_person=restaurant_in.price_per_person,
+        name=register_in.name,
+        category=register_in.category,
+        price_per_person=register_in.price_per_person,
+        owner_phone=register_in.owner_phone,
+        hashed_password=auth.hash_password(register_in.password),
         subscription_started_at=now,
         # 가입 즉시 무료 체험 기간(90일)을 부여한다.
         subscription_free_trial_ends_at=subscription.trial_ends_at(now),
@@ -45,6 +53,13 @@ def create_restaurant(db: Session, restaurant_in: schemas.RestaurantCreate) -> m
     db.add(restaurant)
     db.commit()
     db.refresh(restaurant)
+    return restaurant
+
+
+def authenticate_restaurant(db: Session, owner_phone: str, password: str) -> models.Restaurant:
+    restaurant = get_restaurant_by_owner_phone(db, owner_phone)
+    if restaurant is None or not auth.verify_password(password, restaurant.hashed_password):
+        raise ValueError("invalid_credentials")
     return restaurant
 
 
@@ -104,6 +119,15 @@ def list_user_reservations(db: Session, user_id: int) -> list[models.Reservation
     )
 
 
+def list_restaurant_reservations(db: Session, restaurant_id: int) -> list[models.Reservation]:
+    return (
+        db.query(models.Reservation)
+        .filter(models.Reservation.restaurant_id == restaurant_id)
+        .order_by(models.Reservation.reserved_at.desc())
+        .all()
+    )
+
+
 def create_reservation(
     db: Session, reservation_in: schemas.ReservationCreate, user_id: int
 ) -> models.Reservation:
@@ -147,13 +171,25 @@ def apply_reservation_event(
     db: Session,
     reservation_id: int,
     event_in: schemas.ReservationEventIn,
-    acting_user_id: int,
+    actor_type: str,
+    actor_id: int,
 ) -> models.TrustScoreEvent:
     reservation = db.query(models.Reservation).get(reservation_id)
     if reservation is None:
         raise ValueError("reservation_not_found")
-    if reservation.user_id != acting_user_id:
-        raise ValueError("not_your_reservation")
+
+    # 취소/불가항력 신고는 손님 본인만, 실제 방문 여부(이행/노쇼/지각 등) 보고는
+    # 그 예약을 받은 매장만 할 수 있다 — 손님이 스스로 "노쇼했어요"를 누르는 건
+    # 실제 운영에서 말이 안 되기 때문에 이벤트 종류별로 호출 주체를 나눈다.
+    if event_in.event_type in trust_score.CUSTOMER_INITIATED_EVENTS:
+        if actor_type != "user" or reservation.user_id != actor_id:
+            raise ValueError("not_your_reservation")
+    elif event_in.event_type in trust_score.RESTAURANT_INITIATED_EVENTS:
+        if actor_type != "restaurant" or reservation.restaurant_id != actor_id:
+            raise ValueError("not_your_restaurant_reservation")
+    else:
+        raise ValueError("unsupported_event_type")
+
     user = db.query(models.User).get(reservation.user_id)
     if user is None:
         raise ValueError("user_not_found")

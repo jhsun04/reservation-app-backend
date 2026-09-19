@@ -25,7 +25,7 @@ def register(register_in: schemas.AuthRegister, db: Session = Depends(get_db)):
         user = crud.register_user(db, register_in)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    token = auth.create_access_token(user.id)
+    token = auth.create_access_token(user.id, "user")
     return schemas.TokenOut(access_token=token, user=user)
 
 
@@ -35,8 +35,28 @@ def login(login_in: schemas.AuthLogin, db: Session = Depends(get_db)):
         user = crud.authenticate_user(db, login_in.phone, login_in.password)
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
-    token = auth.create_access_token(user.id)
+    token = auth.create_access_token(user.id, "user")
     return schemas.TokenOut(access_token=token, user=user)
+
+
+@app.post("/restaurant-auth/register", response_model=schemas.RestaurantTokenOut)
+def register_restaurant(register_in: schemas.RestaurantAuthRegister, db: Session = Depends(get_db)):
+    try:
+        restaurant = crud.register_restaurant(db, register_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    token = auth.create_access_token(restaurant.id, "restaurant")
+    return schemas.RestaurantTokenOut(access_token=token, restaurant=restaurant)
+
+
+@app.post("/restaurant-auth/login", response_model=schemas.RestaurantTokenOut)
+def login_restaurant(login_in: schemas.RestaurantAuthLogin, db: Session = Depends(get_db)):
+    try:
+        restaurant = crud.authenticate_restaurant(db, login_in.owner_phone, login_in.password)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    token = auth.create_access_token(restaurant.id, "restaurant")
+    return schemas.RestaurantTokenOut(access_token=token, restaurant=restaurant)
 
 
 @app.get("/users/{user_id}", response_model=schemas.UserOut)
@@ -57,11 +77,6 @@ def list_user_reservations(
     return crud.list_user_reservations(db, user_id)
 
 
-@app.post("/restaurants", response_model=schemas.RestaurantOut)
-def create_restaurant(restaurant_in: schemas.RestaurantCreate, db: Session = Depends(get_db)):
-    return crud.create_restaurant(db, restaurant_in)
-
-
 @app.get("/restaurants", response_model=list[schemas.RestaurantOut])
 def list_restaurants(db: Session = Depends(get_db)):
     return crud.list_restaurants(db)
@@ -80,9 +95,11 @@ def update_subscription_tier(
     restaurant_id: int,
     payload: schemas.SubscriptionTierUpdate,
     db: Session = Depends(get_db),
+    current_restaurant: models.Restaurant = Depends(auth.get_current_restaurant),
 ):
-    """지금은 결제(PG) 연동 전이라 관리자가 수동으로 티어를 바꿔주는 용도.
+    """지금은 결제(PG) 연동 전이라 사장님이 직접(수동으로) 티어를 바꾸는 용도.
     실제 결제 붙으면 이 엔드포인트를 결제 성공 콜백에서 호출하는 식으로 바뀔 것."""
+    auth.require_restaurant_self(restaurant_id, current_restaurant)
     if payload.subscription_tier not in subscription.VALID_TIERS:
         raise HTTPException(status_code=422, detail="invalid_tier")
     try:
@@ -96,8 +113,10 @@ def update_risk_tolerance(
     restaurant_id: int,
     payload: schemas.RiskToleranceUpdate,
     db: Session = Depends(get_db),
+    current_restaurant: models.Restaurant = Depends(auth.get_current_restaurant),
 ):
-    """스탠다드 이상 구독 매장만 자기 가게의 노쇼 리스크 허용도를 바꿀 수 있다."""
+    """스탠다드 이상 구독 매장 사장님만 자기 가게의 노쇼 리스크 허용도를 바꿀 수 있다."""
+    auth.require_restaurant_self(restaurant_id, current_restaurant)
     if payload.risk_tolerance not in subscription.VALID_RISK_TOLERANCES:
         raise HTTPException(status_code=422, detail="invalid_risk_tolerance")
     try:
@@ -113,13 +132,28 @@ def update_price_per_person(
     restaurant_id: int,
     payload: schemas.PricePerPersonUpdate,
     db: Session = Depends(get_db),
+    current_restaurant: models.Restaurant = Depends(auth.get_current_restaurant),
 ):
-    """코스/오마카세처럼 1인당 가격이 고정된 매장만 설정. 이 값이 있어야 CAUTION/RISK
-    구간에서 진짜 %선결제(PREPAID)가 적용되고, 없으면 정액 노쇼시청구(HOLD)로 처리된다."""
+    """코스/오마카세처럼 1인당 가격이 고정된 매장 사장님만 설정. 이 값이 있어야
+    CAUTION/RISK 구간에서 진짜 %선결제(PREPAID)가 적용되고, 없으면 정액
+    노쇼시청구(HOLD)로 처리된다."""
+    auth.require_restaurant_self(restaurant_id, current_restaurant)
     try:
         return crud.update_price_per_person(db, restaurant_id, payload.price_per_person)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/restaurants/{restaurant_id}/reservations", response_model=list[schemas.ReservationOut])
+def list_restaurant_reservations(
+    restaurant_id: int,
+    db: Session = Depends(get_db),
+    current_restaurant: models.Restaurant = Depends(auth.get_current_restaurant),
+):
+    """사장님이 자기 매장으로 들어온 예약 목록을 본다 (예약별로 이행/노쇼 등을
+    처리하는 데 씀)."""
+    auth.require_restaurant_self(restaurant_id, current_restaurant)
+    return crud.list_restaurant_reservations(db, restaurant_id)
 
 
 @app.post("/reservations", response_model=schemas.ReservationOut)
@@ -139,14 +173,18 @@ def apply_reservation_event(
     reservation_id: int,
     event_in: schemas.ReservationEventIn,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    actor: auth.Actor = Depends(auth.get_current_actor),
 ):
+    """취소/불가항력(CANCEL_*, FORCE_MAJEURE)은 손님 토큰으로, 이행/노쇼/지각 등
+    (FULFILLED, NO_SHOW_*, LATE, PARTIAL_NO_SHOW)은 그 예약을 받은 매장 토큰으로만
+    호출할 수 있다 — app/trust_score.py의 CUSTOMER_INITIATED_EVENTS /
+    RESTAURANT_INITIATED_EVENTS 참고."""
     try:
         event = crud.apply_reservation_event(
-            db, reservation_id, event_in, acting_user_id=current_user.id
+            db, reservation_id, event_in, actor_type=actor.type, actor_id=actor.id
         )
     except ValueError as e:
-        if str(e) == "not_your_reservation":
+        if str(e) in ("not_your_reservation", "not_your_restaurant_reservation"):
             raise HTTPException(status_code=403, detail=str(e))
         raise HTTPException(status_code=404, detail=str(e))
 

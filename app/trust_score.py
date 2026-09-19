@@ -74,6 +74,23 @@ FLAT_FULFILLED_BONUS_IN_RISK_BAND = 4  # RISK 구간에서는 스택 보너스 �
 # 노쇼로 간주해 연속 성공 스택을 초기화하는 이벤트
 STREAK_RESETTING_EVENTS = {EventType.NO_SHOW_SAME_DAY, EventType.NO_SHOW_DUPLICATE}
 
+# 이벤트를 누가 발생시킬 수 있는지: 손님이 자기 예약을 취소/불가항력 신고하는 것과
+# 매장이 손님의 실제 방문 여부(이행/노쇼/지각 등)를 보고하는 것은 다른 주체가 눌러야
+# 의미가 있다. 손님 본인이 "저 노쇼했어요"를 스스로 누르는 건 실제 운영에서는 말이
+# 안 되기 때문에, 매장 계정이 생긴 지금부터는 이벤트 종류별로 호출 주체를 나눈다.
+CUSTOMER_INITIATED_EVENTS = {
+    EventType.CANCEL_DAY_BEFORE,
+    EventType.CANCEL_IMMINENT,
+    EventType.FORCE_MAJEURE,
+}
+RESTAURANT_INITIATED_EVENTS = {
+    EventType.FULFILLED,
+    EventType.NO_SHOW_SAME_DAY,
+    EventType.NO_SHOW_DUPLICATE,
+    EventType.LATE,
+    EventType.PARTIAL_NO_SHOW,
+}
+
 RISK_BAND_RECOVERY_MIN_SUCCESS = 3
 RISK_BAND_RECOVERY_MIN_DAYS = 14
 

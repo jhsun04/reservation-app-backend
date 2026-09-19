@@ -85,10 +85,19 @@ def _make_user(client, phone="010-1111-2222"):
     return user
 
 
-def _make_restaurant(client, name="테스트식당"):
-    res = client.post("/restaurants", json={"name": name})
+def _make_restaurant(client, name="테스트식당", owner_phone="010-2222-3333"):
+    """매장 사장님 회원가입 후 {restaurant 딕셔너리 + auth 헤더}를 합쳐서 반환.
+    구독 티어/리스크 허용도/코스가 변경은 이제 그 매장 사장님 토큰이 있어야 하므로,
+    반환값의 ["headers"]를 관리용 요청마다 같이 넘겨주면 된다."""
+    res = client.post(
+        "/restaurant-auth/register",
+        json={"name": name, "owner_phone": owner_phone, "password": "사장님비번1234"},
+    )
     assert res.status_code == 200
-    return res.json()
+    body = res.json()
+    restaurant = dict(body["restaurant"])
+    restaurant["headers"] = {"Authorization": f"Bearer {body['access_token']}"}
+    return restaurant
 
 
 def test_new_restaurant_starts_as_starter_with_free_trial(client):
@@ -105,6 +114,7 @@ def test_starter_tier_cannot_set_risk_tolerance(client):
     res = client.patch(
         f"/restaurants/{restaurant['id']}/risk-tolerance",
         json={"risk_tolerance": "STRICT"},
+        headers=restaurant["headers"],
     )
     assert res.status_code == 403
 
@@ -114,20 +124,26 @@ def test_upgrading_tier_unlocks_risk_tolerance_and_downgrade_resets_it(client):
     rid = restaurant["id"]
 
     upgraded = client.patch(
-        f"/restaurants/{rid}/subscription-tier", json={"subscription_tier": "STANDARD"}
+        f"/restaurants/{rid}/subscription-tier",
+        json={"subscription_tier": "STANDARD"},
+        headers=restaurant["headers"],
     )
     assert upgraded.status_code == 200
     assert upgraded.json()["can_set_risk_tolerance"] is True
 
     set_strict = client.patch(
-        f"/restaurants/{rid}/risk-tolerance", json={"risk_tolerance": "STRICT"}
+        f"/restaurants/{rid}/risk-tolerance",
+        json={"risk_tolerance": "STRICT"},
+        headers=restaurant["headers"],
     )
     assert set_strict.status_code == 200
     assert set_strict.json()["risk_tolerance"] == "STRICT"
 
     # 다시 STARTER로 내리면 리스크 허용도가 NORMAL로 강제 초기화된다
     downgraded = client.patch(
-        f"/restaurants/{rid}/subscription-tier", json={"subscription_tier": "STARTER"}
+        f"/restaurants/{rid}/subscription-tier",
+        json={"subscription_tier": "STARTER"},
+        headers=restaurant["headers"],
     )
     assert downgraded.status_code == 200
     assert downgraded.json()["risk_tolerance"] == "NORMAL"
@@ -179,7 +195,11 @@ def test_deposit_reflects_price_per_person_and_risk_tolerance_multiplier(client)
     rid = restaurant["id"]
 
     # 오마카세처럼 1인당 3만원 코스가 있는 매장으로 설정
-    price_res = client.patch(f"/restaurants/{rid}/price-per-person", json={"price_per_person": 30000})
+    price_res = client.patch(
+        f"/restaurants/{rid}/price-per-person",
+        json={"price_per_person": 30000},
+        headers=restaurant["headers"],
+    )
     assert price_res.status_code == 200
     assert price_res.json()["price_per_person"] == 30000
 
@@ -200,8 +220,16 @@ def test_deposit_reflects_price_per_person_and_risk_tolerance_multiplier(client)
     assert first_body["deposit_amount"] == 15000  # 0.25 * 30000 * 2인
 
     # 매장을 STANDARD로 올리고 리스크 허용도를 STRICT로 설정
-    client.patch(f"/restaurants/{rid}/subscription-tier", json={"subscription_tier": "STANDARD"})
-    client.patch(f"/restaurants/{rid}/risk-tolerance", json={"risk_tolerance": "STRICT"})
+    client.patch(
+        f"/restaurants/{rid}/subscription-tier",
+        json={"subscription_tier": "STANDARD"},
+        headers=restaurant["headers"],
+    )
+    client.patch(
+        f"/restaurants/{rid}/risk-tolerance",
+        json={"risk_tolerance": "STRICT"},
+        headers=restaurant["headers"],
+    )
 
     # 유저 신뢰점수를 CAUTION 구간(25~49)까지 떨어뜨린다: 60 -4 -4 -5 = 47
     for event_type in ("CANCEL_DAY_BEFORE", "CANCEL_DAY_BEFORE", "CANCEL_IMMINENT"):
@@ -252,10 +280,11 @@ def test_partial_no_show_charges_only_the_missing_headcount_not_full_deposit(cli
     assert reservation["deposit_type"] == "HOLD"
     assert reservation["deposit_amount"] == 20000  # STANDARD 5,000원 * 4인
 
+    # 부분 노쇼는 이제 "실제 방문 여부를 판단하는" 매장 쪽 이벤트라서 매장 토큰으로 호출한다
     event_res = client.post(
         f"/reservations/{reservation['id']}/events",
         json={"event_type": "PARTIAL_NO_SHOW", "no_show_count": 1},
-        headers=user["headers"],
+        headers=restaurant["headers"],
     )
     assert event_res.status_code == 200
     body = event_res.json()

@@ -78,6 +78,10 @@ class Restaurant(Base):
     name = Column(String, nullable=False)
     category = Column(String, nullable=True)
 
+    # 매장 사장님 계정 (손님 User와는 별개의 로그인 — app/auth.py 참고)
+    owner_phone = Column(String, unique=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+
     # 구독 티어: STARTER / STANDARD / PREMIUM (문자열로 단순 구현, 나중에 결제 붙이면 확장)
     subscription_tier = Column(String, nullable=False, default="STARTER")
     subscription_started_at = Column(DateTime, default=datetime.utcnow)

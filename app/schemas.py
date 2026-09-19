@@ -38,12 +38,19 @@ class UserOut(BaseModel):
         return trust_score.get_band(self.trust_score).value
 
 
-class RestaurantCreate(BaseModel):
+class RestaurantAuthRegister(BaseModel):
     name: str
     category: Optional[str] = None
     # 코스/오마카세처럼 1인당 가격이 고정된 매장만 입력 (원). 없으면 CAUTION/RISK
     # 구간도 정액 노쇼시청구(HOLD) 방식으로 처리됨 — app/trust_score.py 참고.
     price_per_person: Optional[int] = None
+    owner_phone: str
+    password: str
+
+
+class RestaurantAuthLogin(BaseModel):
+    owner_phone: str
+    password: str
 
 
 class RestaurantOut(BaseModel):
@@ -87,6 +94,12 @@ class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+
+
+class RestaurantTokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    restaurant: RestaurantOut
 
 
 class ReservationCreate(BaseModel):
